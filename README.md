@@ -151,6 +151,25 @@ server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
 
 Zero-argument factories remain fully supported and are called without a context.
 
+### Distributed sessions with Redis
+
+For production deployments running multiple server replicas, swap the default in-memory store for a Redis backend. All session state written via `ctx.set_state` is stored there, so any replica can serve any request from the same session:
+
+```python
+from key_value.aio.stores.redis import RedisStore
+
+session_store = RedisStore(url=os.environ["REDIS_URL"])
+
+server = await create_mcp_server(
+    toolsets=[toolset],
+    deps=make_deps,             # context-aware factory reads from Redis
+    session_state_store=session_store,
+)
+await server.run_async(transport="streamable-http", host="0.0.0.0", port=8000)
+```
+
+`RedisStore` is from the `py-key-value-aio[redis]` package, which FastMCP already depends on. Any backend that implements the `AsyncKeyValue` protocol works — DynamoDB, Firestore, PostgreSQL, Valkey, and more are available in that package.
+
 ### Multiple toolsets
 
 Combine as many toolsets as you like — the same way you would with an agent:
@@ -202,6 +221,7 @@ Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server. 
 | [`examples/02_deps_factory.py`](examples/02_deps_factory.py) | Per-call deps factory, environment config, prompts with runtime context |
 | [`examples/03_reuse_across_agent_and_mcp.py`](examples/03_reuse_across_agent_and_mcp.py) | The core case — one toolset wired to both a pydantic-ai Agent and an MCP server |
 | [`examples/04_session_deps.py`](examples/04_session_deps.py) | Session-scoped caching — expensive auth computed once per MCP session via `ctx.get_state` / `ctx.set_state` |
+| [`examples/05_redis_session_store.py`](examples/05_redis_session_store.py) | Distributed sessions — Redis-backed state shared across replicas, persistent across restarts |
 
 ---
 

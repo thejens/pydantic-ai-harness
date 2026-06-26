@@ -13,7 +13,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-examples = ["httpx>=0.28.1"]
+examples = [
+    "httpx>=0.28.1",
+    "py-key-value-aio[redis]>=0.4.5",
+    "redis>=8.0.1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["pydantic_ai_mcp"]
