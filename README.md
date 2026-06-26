@@ -1,42 +1,36 @@
-# pydantic-ai-mcp
+# pydantic-mcp-demo
 
 Serve a [pydantic-ai](https://ai.pydantic.dev) toolset as an [MCP](https://modelcontextprotocol.io) server. One definition, two surfaces.
 
 ```bash
-pip install git+https://github.com/thejens/pydantic-ai-harness.git
+pip install git+https://github.com/thejens/pydantic-mcp-demo.git
 ```
 
 ---
 
 ## What it looks like
 
-### Minimal
+### Minimal — decorator style
 
-Define a toolset, call `create_mcp_server`, done:
+Instantiate `MCPServer`, decorate tools with `@server.tool()`, call `.run()`:
 
 ```python
-import asyncio
 from dataclasses import dataclass
 from pydantic_ai import RunContext
-from pydantic_ai.toolsets import FunctionToolset
-from pydantic_ai_mcp import create_mcp_server
+from pydantic_ai_mcp import MCPServer
 
 @dataclass
 class Deps:
     api_key: str
 
-toolset: FunctionToolset[Deps] = FunctionToolset(id="demo")
+server = MCPServer(deps=Deps(api_key="sk-…"), name="demo")
 
-@toolset.tool()
+@server.tool()
 async def whoami(ctx: RunContext[Deps]) -> str:
     """Return the current user."""
     return f"Authenticated as {ctx.deps.api_key[:4]}…"
 
-async def main():
-    server = await create_mcp_server(toolsets=[toolset], deps=Deps(api_key="sk-…"))
-    await server.run_async(transport="stdio")
-
-asyncio.run(main())
+server.run(transport="stdio")
 ```
 
 ### One toolset → agent and MCP server
@@ -45,13 +39,20 @@ The whole point: define tools once, use them everywhere:
 
 ```python
 from pydantic_ai import Agent
+from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai_mcp import MCPServer
+
+toolset: FunctionToolset[Deps] = FunctionToolset(id="demo")
+
+@toolset.tool()
+async def whoami(ctx: RunContext[Deps]) -> str: ...
 
 # Agent path — unchanged
 agent = Agent(model="openai:gpt-4o", toolsets=[toolset])
 
 # MCP path — same toolset, deps called fresh per invocation
-server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
-await server.run_async(transport="stdio")
+server = MCPServer(toolsets=[toolset], deps=make_deps)
+server.run(transport="stdio")
 ```
 
 ### Session state
@@ -60,7 +61,7 @@ Persist data across MCP calls without touching FastMCP APIs. Make `Deps` a Pydan
 
 ```python
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_ai_mcp import create_mcp_server
+from pydantic_ai_mcp import MCPServer
 
 class Deps(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -76,16 +77,18 @@ async def make_deps(deps: Deps) -> Deps:
     deps.http = httpx.AsyncClient()        # fresh every call
     return deps
 
-@toolset.tool()
+server = MCPServer(
+    deps=make_deps,
+    session_deps=Deps,                     # enables load-before / save-after
+    name="my-server",
+)
+
+@server.tool()
 def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
     ctx.deps.notes[key] = value            # mutate — auto-saved after this returns
     return f"Stored {key!r}"
 
-server = await create_mcp_server(
-    toolsets=[toolset],
-    deps=make_deps,
-    session_deps=Deps,                     # enables load-before / save-after
-)
+server.run(transport="stdio")
 ```
 
 For distributed deployments, swap the in-memory store for Redis with one extra parameter:
@@ -93,11 +96,29 @@ For distributed deployments, swap the in-memory store for Redis with one extra p
 ```python
 from key_value.aio.stores.redis import RedisStore
 
-server = await create_mcp_server(
-    toolsets=[toolset], deps=make_deps, session_deps=Deps,
+server = MCPServer(
+    deps=make_deps,
+    session_deps=Deps,
     session_state_store=RedisStore(url=os.environ["REDIS_URL"]),
 )
-await server.run_async(transport="streamable-http", host="0.0.0.0", port=8000)
+server.run(transport="streamable-http", host="0.0.0.0", port=8000)
+```
+
+### Mount on FastAPI
+
+`MCPServer` is a `FastMCP` subclass, so `http_app()` is already available:
+
+```python
+from fastapi import FastAPI
+from pydantic_ai_mcp import MCPServer
+
+server = MCPServer(deps=make_deps, name="my-server")
+
+@server.tool()
+async def my_tool(ctx: RunContext[Deps]) -> str: ...
+
+app = FastAPI()
+app.mount("/mcp", server.http_app())
 ```
 
 ---
@@ -105,9 +126,9 @@ await server.run_async(transport="streamable-http", host="0.0.0.0", port=8000)
 ## Installation
 
 ```bash
-pip install git+https://github.com/thejens/pydantic-ai-harness.git
+pip install git+https://github.com/thejens/pydantic-mcp-demo.git
 # or
-uv add git+https://github.com/thejens/pydantic-ai-harness.git
+uv add git+https://github.com/thejens/pydantic-mcp-demo.git
 ```
 
 Requires Python 3.12+ and pydantic-ai ≥ 1.107.
@@ -118,22 +139,17 @@ Requires Python 3.12+ and pydantic-ai ≥ 1.107.
 
 ### Tools
 
-Pass any `AbstractToolset` — the same list you'd pass to `Agent(toolsets=[...])`. The toolset's tools are discovered at startup and registered with FastMCP.
+Register tools with `@server.tool()` (pydantic-ai RunContext convention), or pass pre-built `FunctionToolset` / `AbstractToolset` instances via `toolsets=[…]`.
 
 ### Prompts
 
-Prompt functions follow the same convention as tools — `RunContext` first, then named arguments. They become MCP [prompt templates](https://spec.modelcontextprotocol.io/specification/server/prompts/):
+Prompt functions follow the same convention — `RunContext` first, then named arguments. Register them with `@server.prompt` or pass via `prompts=[…]` at construction:
 
 ```python
+@server.prompt
 async def expert_prompt(ctx: RunContext[Deps], domain: str) -> str:
     """System prompt that makes the model a domain expert."""
     return f"You are an expert {domain} engineer."
-
-server = await create_mcp_server(
-    toolsets=[toolset],
-    deps=make_deps,
-    prompts=[expert_prompt],
-)
 ```
 
 The function name becomes the prompt name; the docstring its description; remaining parameters become MCP prompt arguments.
@@ -150,7 +166,7 @@ async def make_deps_async() -> Deps:
     secret = await vault.get("api_key")
     return Deps(api_key=secret)
 
-server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
+server = MCPServer(deps=make_deps, ...)
 ```
 
 ### Session deps
@@ -171,8 +187,7 @@ By default session state is kept in memory. Pass `session_state_store` to swap t
 ```python
 from key_value.aio.stores.redis import RedisStore
 
-server = await create_mcp_server(
-    toolsets=[toolset],
+server = MCPServer(
     deps=make_deps,
     session_deps=Deps,
     session_state_store=RedisStore(url=os.environ["REDIS_URL"]),
@@ -184,30 +199,35 @@ server = await create_mcp_server(
 ### Multiple toolsets
 
 ```python
-server = await create_mcp_server(
+server = MCPServer(
     toolsets=[search_toolset, files_toolset, metrics_toolset],
     deps=make_deps,
     prompts=[analyst_prompt, researcher_prompt],
     name="full-suite",
     instructions="Company intelligence tools.",
 )
+server.run(transport="stdio")
 ```
 
 ---
 
 ## API
 
+`MCPServer` extends `FastMCP` — all FastMCP methods (`run()`, `run_async()`, `http_app()`, `add_middleware()`, etc.) are inherited.
+
+### Constructor
+
 ```python
-async def create_mcp_server(
-    toolsets: Sequence[AbstractToolset[DepsT]],
-    deps: DepsT | Callable[[], DepsT] | Callable[[DepsT], DepsT],
+MCPServer(
     *,
+    toolsets: Sequence[AbstractToolset[DepsT]] = (),
+    deps: DepsT | Callable[[], DepsT] | Callable[[DepsT], DepsT] = None,
     session_deps: type[DepsT] | None = None,
     prompts: Sequence[Callable[..., Any]] | None = None,
     name: str = "pydantic-ai-mcp",
     bootstrap_deps: Any = None,
-    **fastmcp_kwargs: Any,
-) -> FastMCP:
+    **fastmcp_kwargs,
+)
 ```
 
 | Parameter | Description |
@@ -218,9 +238,22 @@ async def create_mcp_server(
 | `prompts` | `(ctx: RunContext[DepsT], **kwargs) -> str \| list[Message] \| PromptResult` |
 | `name` | Server name shown to MCP clients |
 | `bootstrap_deps` | Deps used only during startup tool discovery (safe as `None` for `FunctionToolset`) |
-| `**fastmcp_kwargs` | Forwarded to `FastMCP(...)` — e.g. `instructions`, `session_state_store` |
+| `**fastmcp_kwargs` | Forwarded to `FastMCP.__init__()` — e.g. `instructions`, `session_state_store`, `lifespan` |
 
-Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server.
+### Decorators
+
+| Decorator | Description |
+|---|---|
+| `@server.tool()` | Register a pydantic-ai style tool (RunContext as first arg) |
+| `@server.prompt` | Register a pydantic-ai style prompt function |
+
+### Inherited from FastMCP
+
+| Method | Description |
+|---|---|
+| `server.run(transport="stdio", ...)` | Start server (sync, blocks until exit) |
+| `server.run_async(transport="stdio", ...)` | Start server (async) |
+| `server.http_app(path=None, transport="http", ...)` | Return ASGI/Starlette app for mounting on FastAPI |
 
 ---
 
@@ -228,8 +261,8 @@ Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server.
 
 | File | What it shows |
 |---|---|
-| [`examples/01_simple_tools.py`](examples/01_simple_tools.py) | Minimal — toolset with fixed deps |
-| [`examples/02_deps_factory.py`](examples/02_deps_factory.py) | Per-call deps factory, env config, prompts |
+| [`examples/01_simple_tools.py`](examples/01_simple_tools.py) | Minimal — `@server.tool()` decorators with fixed deps |
+| [`examples/02_deps_factory.py`](examples/02_deps_factory.py) | Per-call deps factory, env config, `@server.prompt` |
 | [`examples/03_reuse_across_agent_and_mcp.py`](examples/03_reuse_across_agent_and_mcp.py) | Core case — one toolset in both an Agent and an MCP server |
 | [`examples/04_session_deps.py`](examples/04_session_deps.py) | Session state — auth cached once, notes persisted; tools just mutate `ctx.deps` |
 | [`examples/05_redis_session_store.py`](examples/05_redis_session_store.py) | Redis backing — same code as 04, one extra parameter |
@@ -238,7 +271,7 @@ Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server.
 
 ## How it works
 
-`create_mcp_server` calls `toolset.get_tools()` at startup, then wraps each discovered tool in a thin FastMCP `Tool` subclass. On each MCP call:
+`MCPServer` subclasses `FastMCP`. During ASGI lifespan startup it calls `get_tools()` on each registered toolset, then wraps each discovered tool in a thin `FastMCP.Tool` subclass that injects pydantic-ai deps and runs the tool through pydantic-ai's normal call path. On each MCP call:
 
 1. If `session_deps` is set: deserialise stored state → construct `Deps` → pass to factory
 2. Validate and coerce MCP args through pydantic-ai's schema validator

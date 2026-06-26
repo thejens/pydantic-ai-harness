@@ -31,9 +31,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import RunContext
-from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_mcp import create_mcp_server
+from pydantic_ai_mcp import MCPServer
 
 
 # ── deps — one model, two kinds of fields ─────────────────────────────────────
@@ -73,12 +72,20 @@ async def make_deps(deps: Deps) -> Deps:
     return deps
 
 
-# ── toolset ───────────────────────────────────────────────────────────────────
+# ── server ────────────────────────────────────────────────────────────────────
 
-toolset: FunctionToolset[Deps] = FunctionToolset(id="session-demo")
+server = MCPServer(
+    deps=make_deps,
+    session_deps=Deps,    # Deps IS the session model — same class, one definition
+    name="session-demo",
+    instructions=(
+        "Session state demo. Try: remember('x', '1') → recall('x') → "
+        "restart server → recall('x')  (state survives until process exits)."
+    ),
+)
 
 
-@toolset.tool()
+@server.tool()
 def whoami(ctx: RunContext[Deps]) -> dict[str, Any]:
     """Return the current session identity and ephemeral resource handle."""
     return {
@@ -87,42 +94,26 @@ def whoami(ctx: RunContext[Deps]) -> dict[str, Any]:
     }
 
 
-@toolset.tool()
+@server.tool()
 def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
     """Store a note that persists for the lifetime of this MCP session."""
     ctx.deps.notes[key] = value    # mutate — auto-persisted after this returns
     return f"Stored {key!r} = {value!r}"
 
 
-@toolset.tool()
+@server.tool()
 def recall(ctx: RunContext[Deps], key: str) -> str:
     """Retrieve a note stored earlier in this session."""
     value = ctx.deps.notes.get(key)
     return value if value is not None else f"(nothing stored for {key!r})"
 
 
-@toolset.tool()
+@server.tool()
 def forget(ctx: RunContext[Deps], key: str) -> str:
     """Delete a note from the session."""
     ctx.deps.notes.pop(key, None)  # mutate — auto-persisted
     return f"Deleted {key!r}"
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
-
-async def main() -> None:
-    server = await create_mcp_server(
-        toolsets=[toolset],
-        deps=make_deps,
-        session_deps=Deps,    # Deps IS the session model — same class, one definition
-        name="session-demo",
-        instructions=(
-            "Session state demo. Try: remember('x', '1') → recall('x') → "
-            "restart server → recall('x')  (state survives until process exits)."
-        ),
-    )
-    await server.run_async(transport="stdio")
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    server.run(transport="stdio")

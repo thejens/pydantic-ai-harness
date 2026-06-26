@@ -19,7 +19,7 @@ import httpx
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_mcp import create_mcp_server
+from pydantic_ai_mcp import MCPServer
 
 
 # ── shared deps ──────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ async def web_researcher_prompt(ctx: RunContext[Deps], topic: str) -> str:
 # ── agent surface ─────────────────────────────────────────────────────────────
 
 async def run_as_agent() -> None:
-    agent: Agent[Deps, str] = Agent(
+    agent = Agent(
         model="openai:gpt-4o-mini",
         toolsets=[web_toolset],
         output_type=str,
@@ -83,15 +83,14 @@ async def run_as_agent() -> None:
 
 # ── MCP surface ───────────────────────────────────────────────────────────────
 
-async def run_as_mcp() -> None:
-    server = await create_mcp_server(
-        toolsets=[web_toolset],
-        deps=make_deps,
-        prompts=[web_researcher_prompt],
-        name="web-tools",
-        instructions="HTTP tools for fetching and inspecting web pages.",
-    )
-    await server.run_async(transport="stdio")
+# Toolsets can be passed at construction — tools are shared with the Agent above.
+server = MCPServer(
+    toolsets=[web_toolset],
+    deps=make_deps,
+    prompts=[web_researcher_prompt],
+    name="web-tools",
+    instructions="HTTP tools for fetching and inspecting web pages.",
+)
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -101,4 +100,4 @@ if __name__ == "__main__":
     if mode == "--agent":
         asyncio.run(run_as_agent())
     else:
-        asyncio.run(run_as_mcp())
+        server.run(transport="stdio")

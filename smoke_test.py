@@ -1,4 +1,4 @@
-"""Smoke test — creates a server from a FunctionToolset and verifies tools + prompts."""
+"""Smoke test — creates an MCPServer and verifies tools + prompts register correctly."""
 import asyncio
 from dataclasses import dataclass
 
@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_mcp import create_mcp_server
+from pydantic_ai_mcp import MCPServer
 
 
 # --- simple deps ---
@@ -16,37 +16,33 @@ class Deps:
         self.greeting = greeting
 
 
-# --- toolset (same pattern as agentic-service) ---
+# --- server with inline @server.tool() decorators ---
 
-toolset: FunctionToolset[Deps] = FunctionToolset(id="demo")
+server = MCPServer(deps=Deps(greeting="Hello"), name="smoke-test")
 
 
-@toolset.tool()
+@server.tool()
 async def greet(ctx: RunContext[Deps], name: str) -> str:
     """Greet someone by name."""
     return f"{ctx.deps.greeting}, {name}!"
 
 
-@toolset.tool()
+@server.tool()
 def add(ctx: RunContext[Deps], a: int, b: int) -> int:
     """Add two integers."""
     return a + b
 
 
-# --- prompt function ---
-
+@server.prompt
 async def welcome_prompt(ctx: RunContext[Deps], topic: str) -> str:
     """Welcome prompt template for a given topic."""
     return f"{ctx.deps.greeting}! You are an expert on {topic}."
 
 
 async def main() -> None:
-    server = await create_mcp_server(
-        toolsets=[toolset],
-        deps=Deps(greeting="Hello"),
-        prompts=[welcome_prompt],
-        name="smoke-test",
-    )
+    # _discover_and_register() is the same hook the lifespan calls at server startup.
+    # Calling it directly lets us inspect the server without actually running it.
+    await server._discover_and_register()
 
     # Verify tool list
     tools = await server.list_tools()
@@ -80,9 +76,38 @@ async def main() -> None:
 
     print("\nAll smoke tests passed.")
 
-    # ── session_deps smoke test ───────────────────────────────────────────────
+    # ── toolset-based server smoke test ───────────────────────────────────────
+    await _test_toolset_server()
 
+    # ── session_deps smoke test ───────────────────────────────────────────────
     await _test_session_deps()
+
+
+# ── toolset-based server ──────────────────────────────────────────────────────
+
+toolset: FunctionToolset[Deps] = FunctionToolset(id="demo")
+
+
+@toolset.tool()
+async def greet_v2(ctx: RunContext[Deps], name: str) -> str:
+    """Greet someone (toolset variant)."""
+    return f"{ctx.deps.greeting}, {name}!"
+
+
+async def _test_toolset_server() -> None:
+    print("\n-- toolset-based server tests --")
+    ts_server = MCPServer(
+        toolsets=[toolset],
+        deps=Deps(greeting="Hi"),
+        name="toolset-smoke",
+    )
+    await ts_server._discover_and_register()
+
+    tools = await ts_server.list_tools()
+    tool_names = {t.name for t in tools}
+    assert "greet_v2" in tool_names, f"unexpected tools: {tool_names}"
+    print(f"toolset tools registered: {sorted(tool_names)}")
+    print("toolset server smoke tests passed.")
 
 
 # ── session_deps fixtures ─────────────────────────────────────────────────────
@@ -98,21 +123,28 @@ class SessionDeps:
 def make_session_deps(state: State) -> SessionDeps:
     return SessionDeps(state=state)
 
-session_toolset: FunctionToolset[SessionDeps] = FunctionToolset(id="session")
+session_server = MCPServer(
+    deps=make_session_deps,
+    session_deps=State,
+    name="session-smoke",
+)
 
-@session_toolset.tool()
+
+@session_server.tool()
 def increment(ctx: RunContext[SessionDeps]) -> int:
     """Increment the counter and return the new value."""
     ctx.deps.state.counter += 1
     return ctx.deps.state.counter
 
-@session_toolset.tool()
+
+@session_server.tool()
 def set_label(ctx: RunContext[SessionDeps], label: str) -> str:
     """Store a label in the session."""
     ctx.deps.state.label = label
     return label
 
-@session_toolset.tool()
+
+@session_server.tool()
 def get_state(ctx: RunContext[SessionDeps]) -> dict:  # type: ignore[type-arg]
     """Return the full session state."""
     return ctx.deps.state.model_dump()
@@ -121,23 +153,14 @@ def get_state(ctx: RunContext[SessionDeps]) -> dict:  # type: ignore[type-arg]
 async def _test_session_deps() -> None:
     print("\n-- session_deps tests --")
 
-    server = await create_mcp_server(
-        toolsets=[session_toolset],
-        deps=make_session_deps,
-        session_deps=State,
-        name="session-smoke",
-    )
+    await session_server._discover_and_register()
 
-    # Simulate back-to-back tool calls that share state across the call boundary.
-    # FastMCP's in-memory session store is keyed by session_id; call_tool uses
-    # a fresh session context each time via the test client, so we simulate
-    # mutation by calling through the server's tool objects directly.
-    from pydantic_ai_mcp._tool_adapter import _SESSION_STATE_KEY
+    from pydantic_ai_mcp._tool_adapter import _SESSION_STATE_KEY  # noqa: F401
 
-    tool_map = {t.name: t for t in await server.list_tools()}
+    tool_map = {t.name: t for t in await session_server.list_tools()}
     assert {"increment", "set_label", "get_state"} == set(tool_map)
 
-    # Bootstrap a shared in-memory state dict the way the adapter does.
+    # Simulate back-to-back tool calls that share state across the call boundary.
     state = State()
 
     # Manually exercise load/mutate/save cycle to verify mutation is captured.

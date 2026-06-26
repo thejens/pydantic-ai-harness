@@ -8,11 +8,13 @@ you don't have to rediscover them.
 
 ## Goal
 
-A single function `create_mcp_server(toolsets, deps, ...)` that:
-- Takes pydantic-ai `AbstractToolset` instances (the same list you'd pass to `Agent`)
-- Returns a configured `FastMCP` server with those tools registered
-- Optionally accepts pydantic-ai-style prompt functions and registers them as MCP prompts
+An `MCPServer` class that:
+- Subclasses `FastMCP` to inherit `run()`, `run_async()`, `http_app()`, etc.
+- Accepts pydantic-ai `AbstractToolset` instances (the same list you'd pass to `Agent`)
+- Registers tools via `@server.tool()` decorator (pydantic-ai RunContext convention)
+- Optionally accepts pydantic-ai-style prompt functions via `@server.prompt` or `prompts=[…]`
 - Optionally manages per-session state via FastMCP's session store
+- Discovers and registers pydantic-ai tools during ASGI lifespan startup
 
 ---
 
@@ -20,8 +22,8 @@ A single function `create_mcp_server(toolsets, deps, ...)` that:
 
 ```
 pydantic_ai_mcp/
-    __init__.py          # public: create_mcp_server
-    _server.py           # create_mcp_server() + _validate_session_deps()
+    __init__.py          # public: MCPServer
+    _server.py           # MCPServer(FastMCP) + _validate_session_deps()
     _tool_adapter.py     # PydanticAIToolAdapter(Tool) + _load/_save session state
     _prompt_adapter.py   # PydanticAIPromptAdapter(Prompt)
     _context.py          # make_bootstrap_context(), make_call_context()
@@ -85,14 +87,21 @@ class MyPrompt(Prompt):
     async def render(self, arguments: dict[str, Any] | None = None) -> Any:
         ...  # inherited convert_result() handles str / list[Message] / PromptResult
 
-# Server construction
-server = FastMCP(name="...", tools=[adapter1, adapter2], **kwargs)
-server.add_prompt(prompt_adapter)
+# FastMCP constructor — MCPServer passes lifespan= and forwards **fastmcp_kwargs
+FastMCP(name="...", lifespan=my_lifespan_fn, **kwargs)
+
+# Dynamic tool/prompt registration (used in lifespan)
+server.add_tool(PydanticAIToolAdapter(...))
+server.add_prompt(PydanticAIPromptAdapter(...))
 
 # Running
-await server.run_async(transport="stdio")          # local MCP clients
+server.run(transport="stdio")                   # sync, uses anyio.run internally
+await server.run_async(transport="stdio")
 await server.run_async(transport="streamable-http", host="0.0.0.0", port=8000)
-# NOTE: the method is run_async(), NOT run_stdio_async()
+
+# ASGI mounting on FastAPI — inherited from FastMCP
+starlette_app = server.http_app(path=None, transport="http")  # returns StarletteWithLifespan
+fastapi_app.mount("/mcp", starlette_app)
 
 # Session state — available inside Tool.run() and Prompt.render()
 from fastmcp.server.dependencies import get_context
@@ -110,6 +119,91 @@ await server.render_prompt(name, arguments_dict)
 from key_value.aio.stores.redis import RedisStore   # py-key-value-aio[redis]
 FastMCP(..., session_state_store=RedisStore(url="redis://localhost:6379/0"))
 ```
+
+---
+
+## _server.py
+
+`MCPServer` subclasses `FastMCP`. Tool discovery happens during lifespan startup
+via `_discover_and_register()`, which calls `get_tools()` on each toolset (including
+the inline `_inline_toolset` that `@server.tool()` decorates into) and calls
+`self.add_tool()` / `self.add_prompt()` for each result.
+
+```python
+class MCPServer(FastMCP):
+    def __init__(self, *, toolsets=(), deps=None, session_deps=None, prompts=None,
+                 name="pydantic-ai-mcp", bootstrap_deps=None, **fastmcp_kwargs):
+
+        # Set before super().__init__() — lifespan closure reads these at startup
+        self._pai_toolsets = list(toolsets)
+        self._pai_deps = deps
+        self._pai_session_deps = session_deps
+        self._pai_prompts = list(prompts or [])
+        self._pai_bootstrap_deps = bootstrap_deps
+        self._inline_toolset = FunctionToolset()  # receives @server.tool() calls
+
+        user_lifespan = fastmcp_kwargs.pop("lifespan", None)
+
+        @asynccontextmanager
+        async def _pai_lifespan(server: FastMCP):
+            assert isinstance(server, MCPServer)
+            await server._discover_and_register()
+            if user_lifespan is not None:
+                async with user_lifespan(server):
+                    yield
+            else:
+                yield
+
+        super().__init__(name=name, lifespan=_pai_lifespan, **fastmcp_kwargs)
+
+    def tool(self):
+        """@server.tool() — pydantic-ai style (RunContext first arg)."""
+        return self._inline_toolset.tool()
+
+    def prompt(self, fn):
+        """@server.prompt — pydantic-ai style (RunContext first arg)."""
+        self._pai_prompts.append(fn)
+        return fn
+
+    async def _discover_and_register(self):
+        all_toolsets = [*self._pai_toolsets, self._inline_toolset]
+        bootstrap_ctx = make_bootstrap_context(deps=self._pai_bootstrap_deps)
+        for toolset in all_toolsets:
+            async with toolset:
+                discovered = await toolset.get_tools(bootstrap_ctx)
+            for toolset_tool in discovered.values():
+                self.add_tool(PydanticAIToolAdapter.from_toolset_tool(
+                    toolset, toolset_tool, self._pai_deps,
+                    session_deps_cls=self._pai_session_deps,
+                ))
+        for fn in self._pai_prompts:
+            self.add_prompt(PydanticAIPromptAdapter.from_function(
+                fn, self._pai_deps, session_deps_cls=self._pai_session_deps,
+            ))
+
+
+def _validate_session_deps(cls):
+    # Catch structural problems at construction time, not mid-request
+    try:
+        instance = cls()
+    except Exception as exc:
+        raise TypeError(f"session_deps {cls.__name__!r}: all fields must have defaults. {exc}") from exc
+    try:
+        cls.model_validate(instance.model_dump(mode="json"))
+    except Exception as exc:
+        raise TypeError(
+            f"session_deps {cls.__name__!r}: serialisation round-trip failed. "
+            f"Non-serialisable fields must use Field(exclude=True). {exc}"
+        ) from exc
+```
+
+Key design points:
+- `_inline_toolset` is created before `super().__init__()` so that the lifespan
+  closure can reference it via `self` without an AttributeError.
+- `user_lifespan` is composed inside `_pai_lifespan` so users can still pass a
+  `lifespan=` kwarg to `MCPServer(...)` and it will run after pydantic-ai setup.
+- `@server.tool()` decorates into `_inline_toolset`; discovery picks it up automatically.
+- `_discover_and_register()` is also callable directly in tests (without starting the server).
 
 ---
 
@@ -240,47 +334,6 @@ class PydanticAIPromptAdapter(Prompt):
 
 ---
 
-## _server.py
-
-```python
-async def create_mcp_server(toolsets, deps, *, session_deps=None, prompts=None,
-                             name="pydantic-ai-mcp", bootstrap_deps=None, **fastmcp_kwargs):
-    if session_deps is not None:
-        _validate_session_deps(session_deps)
-
-    bootstrap_ctx = make_bootstrap_context(deps=bootstrap_deps)
-    tool_adapters = []
-    for toolset in toolsets:
-        async with toolset:
-            discovered = await toolset.get_tools(bootstrap_ctx)
-        for toolset_tool in discovered.values():
-            tool_adapters.append(
-                PydanticAIToolAdapter.from_toolset_tool(toolset, toolset_tool, deps,
-                                                        session_deps_cls=session_deps))
-
-    server = FastMCP(name=name, tools=tool_adapters, **fastmcp_kwargs)
-    for fn in prompts or []:
-        server.add_prompt(PydanticAIPromptAdapter.from_function(fn, deps, session_deps_cls=session_deps))
-    return server
-
-
-def _validate_session_deps(cls):
-    # Catch structural problems at server startup, not mid-request
-    try:
-        instance = cls()
-    except Exception as exc:
-        raise TypeError(f"session_deps {cls.__name__!r}: all fields must have defaults. {exc}") from exc
-    try:
-        cls.model_validate(instance.model_dump(mode="json"))
-    except Exception as exc:
-        raise TypeError(
-            f"session_deps {cls.__name__!r}: serialisation round-trip failed. "
-            f"Non-serialisable fields must use Field(exclude=True). {exc}"
-        ) from exc
-```
-
----
-
 ## session_deps design
 
 `session_deps` is a Pydantic `BaseModel` class whose instance is the unit of
@@ -315,6 +368,11 @@ nested model fields is respected.
 
 ## Non-obvious findings
 
+- **`run()` / `run_async()` inherited from FastMCP** — do not reimplement. FastMCP uses `anyio.run()` internally (not `asyncio.run()`), which ensures compatibility with both asyncio and trio.
+- **Lifespan for async setup** — pydantic-ai tool discovery requires `async with toolset` + `await toolset.get_tools()`. This must run in the lifespan, not `__init__`. Use `FastMCP(lifespan=...)` and compose with any user-provided lifespan.
+- **Set `_pai_*` attrs before `super().__init__()`** — the lifespan closure captures `self`, and FastMCP may access the lifespan during init. All attributes the lifespan reads must exist before `super().__init__()` returns.
+- **`http_app()` inherited from FastMCP** — returns a `StarletteWithLifespan` app. When mounted on FastAPI via `app.mount("/mcp", server.http_app())`, Starlette automatically manages the sub-app's lifespan (including the pydantic-ai discovery lifespan).
+- **`_discover_and_register()` callable in tests** — avoids starting the full server; call it directly then use `list_tools()`, `call_tool()`, etc.
 - **`run_async()` not `run_stdio_async()`** — FastMCP's run method is `server.run_async(transport="stdio")`.
 - **`render_prompt()` not `get_prompt()`** — `server.get_prompt(name, version)` takes a `VersionSpec` as second arg, not an arguments dict; use `server.render_prompt(name, args_dict)` instead.
 - **`PrivateAttr` works with `extra="forbid"`** — FastMCP's `Tool` and `Prompt` base classes use `extra="forbid"`, but `PrivateAttr` fields live in `__pydantic_private__` and are not subject to that restriction.

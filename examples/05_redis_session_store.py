@@ -33,9 +33,8 @@ from typing import Any
 from key_value.aio.stores.redis import RedisStore
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import RunContext
-from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_mcp import create_mcp_server
+from pydantic_ai_mcp import MCPServer
 
 
 # ── deps ──────────────────────────────────────────────────────────────────────
@@ -67,12 +66,20 @@ async def make_deps(deps: Deps) -> Deps:
     return deps
 
 
-# ── toolset ───────────────────────────────────────────────────────────────────
+# ── server ────────────────────────────────────────────────────────────────────
 
-toolset: FunctionToolset[Deps] = FunctionToolset(id="redis-demo")
+redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+server = MCPServer(
+    deps=make_deps,
+    session_deps=Deps,
+    name="redis-session-demo",
+    instructions="Redis-backed session demo. State persists across server restarts.",
+    session_state_store=RedisStore(url=redis_url),   # only difference from example 04
+)
 
 
-@toolset.tool()
+@server.tool()
 def whoami(ctx: RunContext[Deps]) -> dict[str, Any]:
     """Return the current user and the per-call ephemeral resource."""
     return {
@@ -81,45 +88,28 @@ def whoami(ctx: RunContext[Deps]) -> dict[str, Any]:
     }
 
 
-@toolset.tool()
+@server.tool()
 def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
     """Store a note that survives server restarts."""
     ctx.deps.notes[key] = value
     return f"Stored {key!r} = {value!r}"
 
 
-@toolset.tool()
+@server.tool()
 def recall(ctx: RunContext[Deps], key: str) -> str:
     """Retrieve a previously stored note."""
     value = ctx.deps.notes.get(key)
     return value if value is not None else f"(nothing stored for {key!r})"
 
 
-@toolset.tool()
+@server.tool()
 def forget(ctx: RunContext[Deps], key: str) -> str:
     """Delete a stored note."""
     ctx.deps.notes.pop(key, None)
     return f"Deleted {key!r}"
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
-
-async def main() -> None:
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-
-    server = await create_mcp_server(
-        toolsets=[toolset],
-        deps=make_deps,
-        session_deps=Deps,
-        name="redis-session-demo",
-        instructions="Redis-backed session demo. State persists across server restarts.",
-        session_state_store=RedisStore(url=redis_url),   # only difference from example 04
-    )
-
+if __name__ == "__main__":
     print(f"MCP server running  —  Redis at {redis_url}")
     print("Connect via: http://localhost:8000/mcp")
-    await server.run_async(transport="streamable-http", host="0.0.0.0", port=8000)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    server.run(transport="streamable-http", host="0.0.0.0", port=8000)
