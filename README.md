@@ -128,6 +128,29 @@ async def make_deps_async() -> Deps:
 server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
 ```
 
+### Session deps
+
+Some deps are expensive to compute (auth round-trips, user-profile fetches). If your factory declares one positional argument it receives the FastMCP [`Context`](https://gofastmcp.com/servers/context), which provides session-scoped state that persists across tool calls within the same MCP session:
+
+```python
+from fastmcp.server.context import Context
+
+async def make_deps(ctx: Context) -> Deps:
+    # Fetched once per session, cached for all subsequent calls
+    user_id = await ctx.get_state("user_id")
+    if user_id is None:
+        user_id = await auth_service.get_user()          # expensive — runs once
+        await ctx.set_state("user_id", user_id)          # JSON-serializable → persists
+
+    return Deps(user_id=user_id, request_id=new_uuid())  # cheap per-call part
+
+server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
+```
+
+`ctx.set_state` with the default `serializable=True` stores values in FastMCP's `AsyncKeyValue` store (in-memory by default, swappable for Redis via `FastMCP(session_state_store=...)`). For non-serializable objects like HTTP clients, pass `serializable=False` — those are request-scoped and rebuilt each call, but cheaply from cached serializable data.
+
+Zero-argument factories remain fully supported and are called without a context.
+
 ### Multiple toolsets
 
 Combine as many toolsets as you like — the same way you would with an agent:
@@ -178,6 +201,7 @@ Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server. 
 | [`examples/01_simple_tools.py`](examples/01_simple_tools.py) | Minimal setup — a toolset with fixed deps |
 | [`examples/02_deps_factory.py`](examples/02_deps_factory.py) | Per-call deps factory, environment config, prompts with runtime context |
 | [`examples/03_reuse_across_agent_and_mcp.py`](examples/03_reuse_across_agent_and_mcp.py) | The core case — one toolset wired to both a pydantic-ai Agent and an MCP server |
+| [`examples/04_session_deps.py`](examples/04_session_deps.py) | Session-scoped caching — expensive auth computed once per MCP session via `ctx.get_state` / `ctx.set_state` |
 
 ---
 

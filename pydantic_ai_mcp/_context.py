@@ -45,8 +45,31 @@ async def make_call_context(
 
 async def _resolve_deps(factory: Any) -> Any:
     if callable(factory):
-        result = factory()
+        if _factory_takes_context(factory):
+            from fastmcp.server.dependencies import get_context
+            result = factory(get_context())
+        else:
+            result = factory()
         if inspect.isawaitable(result):
             return await result
         return result
     return factory
+
+
+def _factory_takes_context(factory: Any) -> bool:
+    """Return True if the factory declares at least one positional parameter.
+
+    A positional parameter signals that the factory wants the FastMCP Context
+    injected. Zero-parameter factories are called as-is (backward compatible).
+    """
+    try:
+        sig = inspect.signature(factory)
+        return any(
+            p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            for p in sig.parameters.values()
+        )
+    except (ValueError, TypeError):
+        return False
