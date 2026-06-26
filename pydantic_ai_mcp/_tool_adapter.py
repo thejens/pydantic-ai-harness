@@ -99,4 +99,6 @@ async def _load_session_state(
 async def _save_session_state(session_state: Any, fmcp_ctx: Any) -> None:
     if session_state is None or fmcp_ctx is None:
         return
-    await fmcp_ctx.set_state(_SESSION_STATE_KEY, session_state.model_dump())
+    # mode='json' makes Pydantic validate serializability at dump time rather than
+    # silently passing raw Python objects that only blow up inside ctx.set_state().
+    await fmcp_ctx.set_state(_SESSION_STATE_KEY, session_state.model_dump(mode="json"))

@@ -59,6 +59,9 @@ async def create_mcp_server(
     Returns:
         A configured FastMCP server, ready to run.
     """
+    if session_deps is not None:
+        _validate_session_deps(session_deps)
+
     bootstrap_ctx = make_bootstrap_context(deps=bootstrap_deps)
 
     tool_adapters: list[PydanticAIToolAdapter] = []
@@ -87,3 +90,33 @@ async def create_mcp_server(
         )
 
     return server
+
+
+def _validate_session_deps(cls: type[Any]) -> None:
+    """Eagerly surface structural problems with a session_deps class.
+
+    Checks:
+    1. The class can be instantiated with no arguments (required for new sessions).
+    2. The default instance can be round-tripped through model_dump(mode='json') +
+       model_validate(), which is the exact path taken on every tool call.
+
+    A PydanticSerializationError here means a non-excluded field holds a
+    value that isn't JSON-serializable — mark it with Field(exclude=True).
+    """
+    try:
+        instance = cls()
+    except Exception as exc:
+        raise TypeError(
+            f"session_deps class {cls.__name__!r} could not be instantiated with no "
+            f"arguments. All fields must have defaults. Original error: {exc}"
+        ) from exc
+
+    try:
+        dumped = instance.model_dump(mode="json")
+        cls.model_validate(dumped)
+    except Exception as exc:
+        raise TypeError(
+            f"session_deps class {cls.__name__!r} failed serialization round-trip. "
+            f"Non-serializable fields must be marked with Field(exclude=True). "
+            f"Original error: {exc}"
+        ) from exc
