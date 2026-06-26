@@ -130,48 +130,52 @@ server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
 
 ### Session deps
 
-For state that should persist across MCP tool calls within a session — cached auth tokens, user preferences, accumulated results — define a Pydantic model for the persistent portion and pass it as `session_deps`:
+For state that should persist across MCP tool calls within a session — cached auth tokens, user preferences, accumulated results — make `Deps` a Pydantic model and pass the class as `session_deps`:
 
 ```python
-from pydantic import BaseModel
-from dataclasses import dataclass
+from pydantic import BaseModel, ConfigDict, Field
 
-class SessionState(BaseModel):
-    user_id: str | None = None   # cached after first auth call
-    notes: dict[str, str] = {}   # accumulates across calls
+class Deps(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-@dataclass
-class Deps:
-    state: SessionState          # reference into the session store
+    # Serializable fields — persisted to the session store across calls
+    user_id: str | None = None
+    notes: dict[str, str] = Field(default_factory=dict)
 
-async def make_deps(state: SessionState) -> Deps:
-    if state.user_id is None:
-        state.user_id = await auth_service.get_user()   # runs once, then cached
-    return Deps(state=state)
+    # Ephemeral fields — excluded from the store, rebuilt each call
+    # Mark with Field(exclude=True): omitted by model_dump(), restored to
+    # their default by model_validate() before the factory fills them in.
+    http: httpx.AsyncClient | None = Field(default=None, exclude=True)
+```
+
+Before each tool invocation the serializable fields are deserialised from the store and the instance is passed to the factory. The factory fills in the ephemeral fields using the already-restored session data, then returns the complete `Deps`:
+
+```python
+async def make_deps(deps: Deps) -> Deps:
+    if deps.user_id is None:
+        deps.user_id = await auth_service.get_user()   # runs once per session
+    deps.http = httpx.AsyncClient(headers={"X-User-Id": deps.user_id})
+    return deps
 
 server = await create_mcp_server(
     toolsets=[toolset],
     deps=make_deps,
-    session_deps=SessionState,   # load before / save after every call
+    session_deps=Deps,   # Deps IS the session model — one definition, one class
 )
 ```
 
-Before each tool invocation, `SessionState` is deserialised from the store and passed to `make_deps`. After the call, the same instance is serialised back — so tools can read and write persistent state by mutating `ctx.deps.state` directly, with no coupling to MCP or FastMCP:
+After the call, `model_dump()` serialises only the non-excluded fields back to the store — capturing any mutations the tool made to `ctx.deps`:
 
 ```python
 @toolset.tool()
 def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
-    ctx.deps.state.notes[key] = value   # mutate — auto-persisted
+    ctx.deps.notes[key] = value   # mutate — auto-persisted after this returns
     return f"Stored {key!r}"
-
-@toolset.tool()
-def recall(ctx: RunContext[Deps], key: str) -> str:
-    return ctx.deps.state.notes.get(key, "(not found)")
 ```
 
-This mirrors how pydantic-ai handles mutable deps within a single agent run: the same instance is shared across all tool calls, so mutations are immediately visible to subsequent tools. `session_deps` extends that contract across MCP round-trips, making the session the unit of continuity instead of the run. The same toolset is drop-in compatible with a plain pydantic-ai Agent — just pass `SessionState()` as deps and the tools work identically.
+This mirrors how pydantic-ai shares a mutable deps instance across all tool calls within a single agent run. `session_deps` extends that contract across MCP round-trips, with the MCP session as the unit of continuity instead of the run.
 
-`SessionState` fields must all have defaults (the class is instantiated with no arguments for new sessions).
+All fields must have defaults (the model is instantiated with no arguments for new sessions). The same toolset works with a plain pydantic-ai Agent — pass `Deps()` as deps and tools behave identically.
 
 ### Distributed sessions with Redis
 

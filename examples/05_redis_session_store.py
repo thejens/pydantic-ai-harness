@@ -1,11 +1,17 @@
 """
-Redis session store — distributed, persistent sessions.
+Redis session store — identical pattern to example 04, distributed backing.
 
-Drop ``session_state_store=RedisStore(url=...)`` into the same pattern from
-example 04: the session state is now stored in Redis instead of memory, making
-it persistent across server restarts and shared across replicas.
+Swapping from in-memory to Redis requires exactly one extra parameter:
+``session_state_store=RedisStore(url=...)``. Tool code is unchanged.
 
-Tools don't change at all — they still just mutate ctx.deps.state fields.
+What Redis adds:
+  - Persistence: session state survives server restarts
+  - Distribution: multiple replicas share the same session state
+  - TTL: Redis expires stale sessions automatically
+
+The serializable/ephemeral split from example 04 still applies:
+  - Serializable fields (no ``exclude``) → stored in Redis, shared across replicas
+  - Ephemeral fields (``Field(exclude=True)``) → rebuilt by the factory each call
 
 Prerequisites:
     docker compose -f examples/docker-compose.yml up -d
@@ -14,49 +20,51 @@ Run:
     REDIS_URL=redis://localhost:6379/0 uv run python examples/05_redis_session_store.py
 
 Connect any MCP client to http://localhost:8000/mcp (streamable-http transport).
-To see persistence in action:
+Demo:
   1. Call remember('color', 'blue')
-  2. Restart the server
+  2. Restart the server (Ctrl-C, re-run)
   3. Call recall('color') — still returns 'blue'
 """
 import asyncio
 import os
 import time
-from dataclasses import dataclass
+from typing import Any
 
 from key_value.aio.stores.redis import RedisStore
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_mcp import create_mcp_server
 
 
-# ── session state ─────────────────────────────────────────────────────────────
-
-class SessionState(BaseModel):
-    user_id: str | None = None
-    notes: dict[str, str] = {}
-
-
 # ── deps ──────────────────────────────────────────────────────────────────────
 
-@dataclass
-class Deps:
-    state: SessionState
+class Deps(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # Serializable — stored in Redis, survives restarts, shared across replicas
+    user_id: str | None = None
+    notes: dict[str, str] = Field(default_factory=dict)
+
+    # Ephemeral — rebuilt each call from the restored session data, never stored
+    http_headers: dict[str, str] | None = Field(default=None, exclude=True)
 
 
 # ── factory ───────────────────────────────────────────────────────────────────
 
-async def make_deps(state: SessionState) -> Deps:
-    if state.user_id is None:
+async def make_deps(deps: Deps) -> Deps:
+    if deps.user_id is None:
         print("  [auth] first call — authenticating…")
         await asyncio.sleep(0.1)
-        state.user_id = f"user-{int(time.time())}"
-        print(f"  [auth] user_id={state.user_id} cached in Redis")
+        deps.user_id = f"user-{int(time.time())}"
+        print(f"  [auth] user_id={deps.user_id} cached in Redis")
     else:
-        print(f"  [auth] reused user_id={state.user_id} from Redis")
-    return Deps(state=state)
+        print(f"  [auth] reused user_id={deps.user_id} from Redis")
+
+    # Build ephemeral resource from the now-available session data
+    deps.http_headers = {"X-User-Id": deps.user_id}
+    return deps
 
 
 # ── toolset ───────────────────────────────────────────────────────────────────
@@ -65,29 +73,32 @@ toolset: FunctionToolset[Deps] = FunctionToolset(id="redis-demo")
 
 
 @toolset.tool()
-def whoami(ctx: RunContext[Deps]) -> dict[str, str | None]:
-    """Return the authenticated user for this session."""
-    return {"user_id": ctx.deps.state.user_id}
+def whoami(ctx: RunContext[Deps]) -> dict[str, Any]:
+    """Return the current user and the per-call ephemeral resource."""
+    return {
+        "user_id": ctx.deps.user_id,
+        "http_headers": ctx.deps.http_headers,
+    }
 
 
 @toolset.tool()
 def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
     """Store a note that survives server restarts."""
-    ctx.deps.state.notes[key] = value
+    ctx.deps.notes[key] = value
     return f"Stored {key!r} = {value!r}"
 
 
 @toolset.tool()
 def recall(ctx: RunContext[Deps], key: str) -> str:
     """Retrieve a previously stored note."""
-    value = ctx.deps.state.notes.get(key)
+    value = ctx.deps.notes.get(key)
     return value if value is not None else f"(nothing stored for {key!r})"
 
 
 @toolset.tool()
 def forget(ctx: RunContext[Deps], key: str) -> str:
     """Delete a stored note."""
-    ctx.deps.state.notes.pop(key, None)
+    ctx.deps.notes.pop(key, None)
     return f"Deleted {key!r}"
 
 
@@ -99,12 +110,10 @@ async def main() -> None:
     server = await create_mcp_server(
         toolsets=[toolset],
         deps=make_deps,
-        session_deps=SessionState,
+        session_deps=Deps,
         name="redis-session-demo",
-        instructions="Redis-backed sessions. State persists across server restarts.",
-        # One parameter swaps the backing store from in-memory to Redis.
-        # The session_deps load/save logic in the adapter is unchanged.
-        session_state_store=RedisStore(url=redis_url),
+        instructions="Redis-backed session demo. State persists across server restarts.",
+        session_state_store=RedisStore(url=redis_url),   # only difference from example 04
     )
 
     print(f"MCP server running  —  Redis at {redis_url}")

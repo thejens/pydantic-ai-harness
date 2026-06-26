@@ -1,70 +1,76 @@
 """
-Session deps — transparent state persistence across MCP calls.
+Session deps — one Deps model, serializable and ephemeral fields mixed.
 
-The ``session_deps`` parameter tells pydantic-ai-mcp to load a Pydantic model
-from the session store before each call and save it back after. Tools mutate
-``ctx.deps`` normally — no awareness of FastMCP or sessions required.
+A Pydantic model can hold both kinds of fields:
 
-This mirrors how pydantic-ai handles mutable deps within a single agent run:
-the same deps instance is shared across all tool calls, so any field the first
-tool sets is visible to the next. ``session_deps`` extends that contract across
-MCP round-trips, making the session the unit of continuity instead of the run.
+  - Serializable fields (str, int, dict, …) — persisted to the session store
+    across every MCP call, shared across replicas.
 
-The same toolset is drop-in compatible with a regular pydantic-ai Agent — just
-pass a ``SessionState()`` as deps and the tools work identically.
+  - Ephemeral fields — excluded from serialization with ``Field(exclude=True)``.
+    Restored to their defaults before each call; the factory fills them back in.
 
-Run with:
+The library loads the serializable fields from the store, constructs a ``Deps``
+instance, calls the factory with it (so the factory can fill in ephemeral
+resources using the already-restored session data), then saves the serializable
+fields back after the tool returns.
+
+Tool functions just mutate ``ctx.deps`` directly — no awareness of which fields
+are persistent vs. ephemeral is needed.
+
+This mirrors how pydantic-ai shares a mutable deps instance across all tool calls
+within a single agent run. ``session_deps`` extends that contract across MCP
+round-trips, with the session as the unit of continuity.
+
+Run:
     uv run python examples/04_session_deps.py
-Then connect any MCP client to the stdio process.
+Connect any MCP client to the stdio process.
 """
 import asyncio
 import time
-from dataclasses import dataclass
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_mcp import create_mcp_server
 
 
-# ── session state (the persistent, serializable part) ─────────────────────────
+# ── deps — one model, two kinds of fields ─────────────────────────────────────
 
-class SessionState(BaseModel):
-    """Persisted across every tool call in this MCP session.
+class Deps(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    All fields must have defaults — the model is constructed with no arguments
-    when a session is brand new.
-    """
-    user_id: str | None = None     # cached after first auth round-trip
-    notes: dict[str, str] = {}
+    # ── serializable: persisted to the session store ──
+    user_id: str | None = None
+    notes: dict[str, str] = Field(default_factory=dict)
 
-
-# ── deps (may include non-serializable resources) ─────────────────────────────
-
-@dataclass
-class Deps:
-    state: SessionState            # reference into the session store
+    # ── ephemeral: rebuilt each call, not persisted ───
+    # Use Field(exclude=True) so model_dump() omits these and model_validate()
+    # restores them to their default (None here). The factory fills them in.
+    expensive_resource: Any | None = Field(default=None, exclude=True)
 
 
-# ── deps factory — receives the pre-loaded session state ──────────────────────
+# ── factory — receives the pre-loaded Deps, fills in ephemeral fields ─────────
 
-async def make_deps(state: SessionState) -> Deps:
+async def make_deps(deps: Deps) -> Deps:
     """Called before every tool invocation.
 
-    ``state`` is already populated from the session store. Mutate it here
-    to cache expensive-to-compute values — the mutations are saved after
-    the tool returns.
+    ``deps.user_id`` and ``deps.notes`` are already loaded from the session
+    store. Authenticate once, then fill in non-serializable resources every call.
     """
-    if state.user_id is None:
-        # Simulates an auth round-trip. Runs once per session, never again.
+    if deps.user_id is None:
+        # Simulates an auth round-trip. Runs once per session.
         print("  [auth] first call — authenticating…", flush=True)
         await asyncio.sleep(0.1)
-        state.user_id = f"user-{int(time.time())}"
-        print(f"  [auth] user_id={state.user_id} (will be cached)", flush=True)
+        deps.user_id = f"user-{int(time.time())}"    # mutation → will be persisted
+        print(f"  [auth] user_id={deps.user_id}", flush=True)
     else:
-        print(f"  [auth] reused cached user_id={state.user_id}", flush=True)
-    return Deps(state=state)
+        print(f"  [auth] reused user_id={deps.user_id}", flush=True)
+
+    # Ephemeral resource built fresh each call using the now-available user_id.
+    deps.expensive_resource = f"<resource for {deps.user_id}>"
+    return deps
 
 
 # ── toolset ───────────────────────────────────────────────────────────────────
@@ -73,29 +79,32 @@ toolset: FunctionToolset[Deps] = FunctionToolset(id="session-demo")
 
 
 @toolset.tool()
-def whoami(ctx: RunContext[Deps]) -> dict[str, str | None]:
-    """Return the authenticated user for this session."""
-    return {"user_id": ctx.deps.state.user_id}
+def whoami(ctx: RunContext[Deps]) -> dict[str, Any]:
+    """Return the current session identity and ephemeral resource handle."""
+    return {
+        "user_id": ctx.deps.user_id,
+        "resource": ctx.deps.expensive_resource,
+    }
 
 
 @toolset.tool()
 def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
-    """Store a note for this session."""
-    ctx.deps.state.notes[key] = value    # just mutate — auto-saved
+    """Store a note that persists for the lifetime of this MCP session."""
+    ctx.deps.notes[key] = value    # mutate — auto-persisted after this returns
     return f"Stored {key!r} = {value!r}"
 
 
 @toolset.tool()
 def recall(ctx: RunContext[Deps], key: str) -> str:
     """Retrieve a note stored earlier in this session."""
-    value = ctx.deps.state.notes.get(key)
+    value = ctx.deps.notes.get(key)
     return value if value is not None else f"(nothing stored for {key!r})"
 
 
 @toolset.tool()
 def forget(ctx: RunContext[Deps], key: str) -> str:
     """Delete a note from the session."""
-    ctx.deps.state.notes.pop(key, None)  # just mutate — auto-saved
+    ctx.deps.notes.pop(key, None)  # mutate — auto-persisted
     return f"Deleted {key!r}"
 
 
@@ -105,10 +114,11 @@ async def main() -> None:
     server = await create_mcp_server(
         toolsets=[toolset],
         deps=make_deps,
-        session_deps=SessionState,   # enables load-before / save-after
+        session_deps=Deps,    # Deps IS the session model — same class, one definition
         name="session-demo",
         instructions=(
-            "Session state demo. Try: remember('x', '1') → recall('x') → forget('x') → recall('x')."
+            "Session state demo. Try: remember('x', '1') → recall('x') → "
+            "restart server → recall('x')  (state survives until process exits)."
         ),
     )
     await server.run_async(transport="stdio")
