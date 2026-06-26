@@ -29,11 +29,27 @@ def make_bootstrap_context(deps: Any = None, *, max_retries: int = 0) -> RunCont
 async def make_call_context(
     factory: Any,
     *,
+    session_state: Any = None,
     tool_name: str | None = None,
     max_retries: int = 0,
 ) -> RunContext[Any]:
-    """RunContext for a live tool or prompt call with fresh deps per invocation."""
-    deps = await _resolve_deps(factory)
+    """RunContext for a live tool or prompt call.
+
+    When session_state is provided the factory is called as factory(session_state)
+    — the session state is passed by reference, so mutations made to it by tool
+    functions are automatically visible after the call returns.
+
+    Without session_state the factory is resolved via the standard rules: plain
+    instance returned as-is, zero-arg callable invoked, context-aware callable
+    (one positional param) receives the FastMCP Context.
+    """
+    if session_state is not None:
+        deps = factory(session_state)
+        if inspect.isawaitable(deps):
+            deps = await deps
+    else:
+        deps = await _resolve_deps(factory)
+
     return RunContext(
         deps=deps,
         model=_STUB_MODEL,

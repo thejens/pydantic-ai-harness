@@ -1,107 +1,94 @@
 """
 Redis session store — distributed, persistent sessions.
 
-By default FastMCP keeps session state in memory: it's fast, but sessions
-vanish on restart and can't be shared across processes. Swapping to a Redis
-backend takes one line and makes sessions:
+Drop ``session_state_store=RedisStore(url=...)`` into the same pattern from
+example 04: the session state is now stored in Redis instead of memory, making
+it persistent across server restarts and shared across replicas.
 
-  - Persistent  — survive server restarts
-  - Distributed — shared across multiple server replicas
-  - Configurable TTL — expired automatically by Redis
-
-This example runs an HTTP server (streamable-http transport) because that's
-the transport used in production deployments. Each HTTP request carries an
-"mcp-session-id" header that FastMCP uses as the stable session key — the
-same session_id is sent back by Redis regardless of which replica handles
-the request.
+Tools don't change at all — they still just mutate ctx.deps.state fields.
 
 Prerequisites:
-    docker run -p 6379:6379 redis:latest
+    docker compose -f examples/docker-compose.yml up -d
 
 Run:
     REDIS_URL=redis://localhost:6379/0 uv run python examples/05_redis_session_store.py
 
-Connect any MCP client to http://localhost:8000/mcp (streamable-http).
+Connect any MCP client to http://localhost:8000/mcp (streamable-http transport).
+To see persistence in action:
+  1. Call remember('color', 'blue')
+  2. Restart the server
+  3. Call recall('color') — still returns 'blue'
 """
 import asyncio
 import os
 import time
 from dataclasses import dataclass
 
-from fastmcp.server.context import Context
-from fastmcp.server.dependencies import get_context
 from key_value.aio.stores.redis import RedisStore
+from pydantic import BaseModel
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_mcp import create_mcp_server
 
 
+# ── session state ─────────────────────────────────────────────────────────────
+
+class SessionState(BaseModel):
+    user_id: str | None = None
+    notes: dict[str, str] = {}
+
+
 # ── deps ──────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Deps:
-    user_id: str      # resolved once per session (from Redis cache)
-    session_id: str
+    state: SessionState
 
 
-# ── simulated auth service ────────────────────────────────────────────────────
+# ── factory ───────────────────────────────────────────────────────────────────
 
-async def _authenticate() -> str:
-    """Simulate an auth round-trip that takes ~200 ms."""
-    await asyncio.sleep(0.2)
-    return f"user-{int(time.time())}"
-
-
-# ── context-aware factory — reads/writes to Redis via FastMCP ─────────────────
-
-async def make_deps(ctx: Context) -> Deps:
-    """Resolve deps for each tool call.
-
-    user_id is fetched from the auth service once per MCP session, then cached
-    in Redis. Every replica that receives a subsequent request from the same
-    session skips the auth call and reads from Redis directly.
-    """
-    user_id: str | None = await ctx.get_state("user_id")
-
-    if user_id is None:
-        print(f"  [session {ctx.session_id[:8]}] auth: first call — fetching user_id")
-        user_id = await _authenticate()
-        await ctx.set_state("user_id", user_id)
-        print(f"  [session {ctx.session_id[:8]}] auth: cached user_id={user_id} in Redis")
+async def make_deps(state: SessionState) -> Deps:
+    if state.user_id is None:
+        print("  [auth] first call — authenticating…")
+        await asyncio.sleep(0.1)
+        state.user_id = f"user-{int(time.time())}"
+        print(f"  [auth] user_id={state.user_id} cached in Redis")
     else:
-        print(f"  [session {ctx.session_id[:8]}] auth: reused user_id={user_id} from Redis")
-
-    return Deps(user_id=user_id, session_id=ctx.session_id)
+        print(f"  [auth] reused user_id={state.user_id} from Redis")
+    return Deps(state=state)
 
 
 # ── toolset ───────────────────────────────────────────────────────────────────
 
-toolset: FunctionToolset[Deps] = FunctionToolset(id="demo")
+toolset: FunctionToolset[Deps] = FunctionToolset(id="redis-demo")
 
 
 @toolset.tool()
-def whoami(ctx: RunContext[Deps]) -> dict[str, str]:
-    """Return current session identity."""
-    return {
-        "user_id": ctx.deps.user_id,
-        "session_id": ctx.deps.session_id,
-    }
+def whoami(ctx: RunContext[Deps]) -> dict[str, str | None]:
+    """Return the authenticated user for this session."""
+    return {"user_id": ctx.deps.state.user_id}
 
 
 @toolset.tool()
-async def store_note(ctx: RunContext[Deps], key: str, value: str) -> str:
-    """Persist a note for this session (survives server restart)."""
-    fmcp_ctx = get_context()   # FastMCP context available anywhere during a request
-    await fmcp_ctx.set_state(f"note:{key}", value)
-    return f"Stored note[{key!r}] for session {ctx.deps.session_id[:8]}"
+def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
+    """Store a note that survives server restarts."""
+    ctx.deps.state.notes[key] = value
+    return f"Stored {key!r} = {value!r}"
 
 
 @toolset.tool()
-async def read_note(ctx: RunContext[Deps], key: str) -> str | None:
-    """Read a previously stored note."""
-    fmcp_ctx = Context.get()
-    return await fmcp_ctx.get_state(f"note:{key}")
+def recall(ctx: RunContext[Deps], key: str) -> str:
+    """Retrieve a previously stored note."""
+    value = ctx.deps.state.notes.get(key)
+    return value if value is not None else f"(nothing stored for {key!r})"
+
+
+@toolset.tool()
+def forget(ctx: RunContext[Deps], key: str) -> str:
+    """Delete a stored note."""
+    ctx.deps.state.notes.pop(key, None)
+    return f"Deleted {key!r}"
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -109,22 +96,19 @@ async def read_note(ctx: RunContext[Deps], key: str) -> str | None:
 async def main() -> None:
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
-    # RedisStore implements AsyncKeyValue — drop it straight into FastMCP.
-    # All session state (user_id, notes, anything set via ctx.set_state) is
-    # stored here, keyed by session_id, shared across all replicas.
-    session_store = RedisStore(url=redis_url)
-
     server = await create_mcp_server(
         toolsets=[toolset],
         deps=make_deps,
+        session_deps=SessionState,
         name="redis-session-demo",
-        instructions="Demonstrates Redis-backed session state shared across replicas.",
-        # FastMCP forwards this to _state_store — one line to go distributed.
-        session_state_store=session_store,
+        instructions="Redis-backed sessions. State persists across server restarts.",
+        # One parameter swaps the backing store from in-memory to Redis.
+        # The session_deps load/save logic in the adapter is unchanged.
+        session_state_store=RedisStore(url=redis_url),
     )
 
-    print(f"Starting MCP server with Redis session store at {redis_url}")
-    print("Connect via: http://localhost:8000/mcp (streamable-http)")
+    print(f"MCP server running  —  Redis at {redis_url}")
+    print("Connect via: http://localhost:8000/mcp")
     await server.run_async(transport="streamable-http", host="0.0.0.0", port=8000)
 
 

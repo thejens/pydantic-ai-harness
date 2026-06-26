@@ -1,73 +1,70 @@
 """
-Session deps example — per-session dependency caching.
+Session deps — transparent state persistence across MCP calls.
 
-Some deps are expensive to build (auth round-trips, DB handshakes, user-profile
-fetches). This example shows how to compute them once per MCP session and reuse
-them across tool calls, using FastMCP's built-in session state.
+The ``session_deps`` parameter tells pydantic-ai-mcp to load a Pydantic model
+from the session store before each call and save it back after. Tools mutate
+``ctx.deps`` normally — no awareness of FastMCP or sessions required.
 
-The key: if your deps factory accepts one argument, it receives the FastMCP
-Context. From there you can read/write session-scoped state with ctx.get_state()
-and ctx.set_state().
+This mirrors how pydantic-ai handles mutable deps within a single agent run:
+the same deps instance is shared across all tool calls, so any field the first
+tool sets is visible to the next. ``session_deps`` extends that contract across
+MCP round-trips, making the session the unit of continuity instead of the run.
+
+The same toolset is drop-in compatible with a regular pydantic-ai Agent — just
+pass a ``SessionState()`` as deps and the tools work identically.
 
 Run with:
     uv run python examples/04_session_deps.py
+Then connect any MCP client to the stdio process.
 """
 import asyncio
 import time
 from dataclasses import dataclass
 
-from fastmcp.server.context import Context
+from pydantic import BaseModel
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_mcp import create_mcp_server
 
 
-# ── deps ──────────────────────────────────────────────────────────────────────
+# ── session state (the persistent, serializable part) ─────────────────────────
+
+class SessionState(BaseModel):
+    """Persisted across every tool call in this MCP session.
+
+    All fields must have defaults — the model is constructed with no arguments
+    when a session is brand new.
+    """
+    user_id: str | None = None     # cached after first auth round-trip
+    notes: dict[str, str] = {}
+
+
+# ── deps (may include non-serializable resources) ─────────────────────────────
 
 @dataclass
 class Deps:
-    user_id: str
-    session_id: str
-    call_count: int   # per-call state (not cached)
+    state: SessionState            # reference into the session store
 
 
-# ── simulated expensive auth ──────────────────────────────────────────────────
+# ── deps factory — receives the pre-loaded session state ──────────────────────
 
-async def _fetch_user_id() -> str:
-    """Pretend this hits an auth service. Takes 200 ms."""
-    await asyncio.sleep(0.2)
-    return f"user-{int(time.time())}"
+async def make_deps(state: SessionState) -> Deps:
+    """Called before every tool invocation.
 
-
-# ── context-aware deps factory ────────────────────────────────────────────────
-
-_call_counts: dict[str, int] = {}   # not worth serializing — resets on restart
-
-async def make_deps(ctx: Context) -> Deps:
-    """Called per tool invocation.
-
-    user_id is fetched once per MCP session and stored in session state.
-    Subsequent calls in the same session retrieve it instantly.
+    ``state`` is already populated from the session store. Mutate it here
+    to cache expensive-to-compute values — the mutations are saved after
+    the tool returns.
     """
-    # Session-scoped: persists across tool calls within this MCP session
-    user_id = await ctx.get_state("user_id")
-    if user_id is None:
-        print("  [auth] fetching user_id for new session…", flush=True)
-        user_id = await _fetch_user_id()
-        await ctx.set_state("user_id", user_id)   # serializable → survives reconnect
-        print(f"  [auth] cached user_id={user_id}", flush=True)
+    if state.user_id is None:
+        # Simulates an auth round-trip. Runs once per session, never again.
+        print("  [auth] first call — authenticating…", flush=True)
+        await asyncio.sleep(0.1)
+        state.user_id = f"user-{int(time.time())}"
+        print(f"  [auth] user_id={state.user_id} (will be cached)", flush=True)
     else:
-        print(f"  [auth] reused cached user_id={user_id}", flush=True)
-
-    session_id = ctx.session_id
-    _call_counts[session_id] = _call_counts.get(session_id, 0) + 1
-
-    return Deps(
-        user_id=user_id,
-        session_id=session_id,
-        call_count=_call_counts[session_id],
-    )
+        print(f"  [auth] reused cached user_id={state.user_id}", flush=True)
+    return Deps(state=state)
 
 
 # ── toolset ───────────────────────────────────────────────────────────────────
@@ -76,19 +73,30 @@ toolset: FunctionToolset[Deps] = FunctionToolset(id="session-demo")
 
 
 @toolset.tool()
-def whoami(ctx: RunContext[Deps]) -> dict[str, str | int]:
-    """Return identity and call statistics for the current session."""
-    return {
-        "user_id": ctx.deps.user_id,
-        "session_id": ctx.deps.session_id,
-        "calls_this_session": ctx.deps.call_count,
-    }
+def whoami(ctx: RunContext[Deps]) -> dict[str, str | None]:
+    """Return the authenticated user for this session."""
+    return {"user_id": ctx.deps.state.user_id}
 
 
 @toolset.tool()
-def greet(ctx: RunContext[Deps], name: str) -> str:
-    """Greet someone, personalised to the authenticated user."""
-    return f"Hi {name}! You are authenticated as {ctx.deps.user_id}."
+def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
+    """Store a note for this session."""
+    ctx.deps.state.notes[key] = value    # just mutate — auto-saved
+    return f"Stored {key!r} = {value!r}"
+
+
+@toolset.tool()
+def recall(ctx: RunContext[Deps], key: str) -> str:
+    """Retrieve a note stored earlier in this session."""
+    value = ctx.deps.state.notes.get(key)
+    return value if value is not None else f"(nothing stored for {key!r})"
+
+
+@toolset.tool()
+def forget(ctx: RunContext[Deps], key: str) -> str:
+    """Delete a note from the session."""
+    ctx.deps.state.notes.pop(key, None)  # just mutate — auto-saved
+    return f"Deleted {key!r}"
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -96,11 +104,11 @@ def greet(ctx: RunContext[Deps], name: str) -> str:
 async def main() -> None:
     server = await create_mcp_server(
         toolsets=[toolset],
-        deps=make_deps,           # one positional arg → receives FastMCP Context
+        deps=make_deps,
+        session_deps=SessionState,   # enables load-before / save-after
         name="session-demo",
         instructions=(
-            "Demo server showing per-session dep caching. "
-            "Call whoami() twice — the second call reuses the cached user_id."
+            "Session state demo. Try: remember('x', '1') → recall('x') → forget('x') → recall('x')."
         ),
     )
     await server.run_async(transport="stdio")

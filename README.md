@@ -130,45 +130,66 @@ server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
 
 ### Session deps
 
-Some deps are expensive to compute (auth round-trips, user-profile fetches). If your factory declares one positional argument it receives the FastMCP [`Context`](https://gofastmcp.com/servers/context), which provides session-scoped state that persists across tool calls within the same MCP session:
+For state that should persist across MCP tool calls within a session — cached auth tokens, user preferences, accumulated results — define a Pydantic model for the persistent portion and pass it as `session_deps`:
 
 ```python
-from fastmcp.server.context import Context
+from pydantic import BaseModel
+from dataclasses import dataclass
 
-async def make_deps(ctx: Context) -> Deps:
-    # Fetched once per session, cached for all subsequent calls
-    user_id = await ctx.get_state("user_id")
-    if user_id is None:
-        user_id = await auth_service.get_user()          # expensive — runs once
-        await ctx.set_state("user_id", user_id)          # JSON-serializable → persists
+class SessionState(BaseModel):
+    user_id: str | None = None   # cached after first auth call
+    notes: dict[str, str] = {}   # accumulates across calls
 
-    return Deps(user_id=user_id, request_id=new_uuid())  # cheap per-call part
+@dataclass
+class Deps:
+    state: SessionState          # reference into the session store
 
-server = await create_mcp_server(toolsets=[toolset], deps=make_deps)
+async def make_deps(state: SessionState) -> Deps:
+    if state.user_id is None:
+        state.user_id = await auth_service.get_user()   # runs once, then cached
+    return Deps(state=state)
+
+server = await create_mcp_server(
+    toolsets=[toolset],
+    deps=make_deps,
+    session_deps=SessionState,   # load before / save after every call
+)
 ```
 
-`ctx.set_state` with the default `serializable=True` stores values in FastMCP's `AsyncKeyValue` store (in-memory by default, swappable for Redis via `FastMCP(session_state_store=...)`). For non-serializable objects like HTTP clients, pass `serializable=False` — those are request-scoped and rebuilt each call, but cheaply from cached serializable data.
+Before each tool invocation, `SessionState` is deserialised from the store and passed to `make_deps`. After the call, the same instance is serialised back — so tools can read and write persistent state by mutating `ctx.deps.state` directly, with no coupling to MCP or FastMCP:
 
-Zero-argument factories remain fully supported and are called without a context.
+```python
+@toolset.tool()
+def remember(ctx: RunContext[Deps], key: str, value: str) -> str:
+    ctx.deps.state.notes[key] = value   # mutate — auto-persisted
+    return f"Stored {key!r}"
+
+@toolset.tool()
+def recall(ctx: RunContext[Deps], key: str) -> str:
+    return ctx.deps.state.notes.get(key, "(not found)")
+```
+
+This mirrors how pydantic-ai handles mutable deps within a single agent run: the same instance is shared across all tool calls, so mutations are immediately visible to subsequent tools. `session_deps` extends that contract across MCP round-trips, making the session the unit of continuity instead of the run. The same toolset is drop-in compatible with a plain pydantic-ai Agent — just pass `SessionState()` as deps and the tools work identically.
+
+`SessionState` fields must all have defaults (the class is instantiated with no arguments for new sessions).
 
 ### Distributed sessions with Redis
 
-For production deployments running multiple server replicas, swap the default in-memory store for a Redis backend. All session state written via `ctx.set_state` is stored there, so any replica can serve any request from the same session:
+By default session state is kept in memory. For persistence across restarts and sharing across replicas, pass `session_state_store` to swap the backend:
 
 ```python
 from key_value.aio.stores.redis import RedisStore
 
-session_store = RedisStore(url=os.environ["REDIS_URL"])
-
 server = await create_mcp_server(
     toolsets=[toolset],
-    deps=make_deps,             # context-aware factory reads from Redis
-    session_state_store=session_store,
+    deps=make_deps,
+    session_deps=SessionState,
+    session_state_store=RedisStore(url=os.environ["REDIS_URL"]),
 )
 await server.run_async(transport="streamable-http", host="0.0.0.0", port=8000)
 ```
 
-`RedisStore` is from the `py-key-value-aio[redis]` package, which FastMCP already depends on. Any backend that implements the `AsyncKeyValue` protocol works — DynamoDB, Firestore, PostgreSQL, Valkey, and more are available in that package.
+The load/save logic in the adapter is unchanged — only the backing store differs. `RedisStore` comes from the `py-key-value-aio[redis]` package. Any backend implementing the `AsyncKeyValue` protocol works: DynamoDB, Firestore, PostgreSQL, Valkey, and more are available in that package.
 
 ### Multiple toolsets
 
@@ -191,8 +212,9 @@ server = await create_mcp_server(
 ```python
 async def create_mcp_server(
     toolsets: Sequence[AbstractToolset[DepsT]],
-    deps: DepsT | Callable[[], DepsT] | Callable[[], Awaitable[DepsT]],
+    deps: DepsT | Callable[[], DepsT] | Callable[[SessionDepsT], DepsT],
     *,
+    session_deps: type[SessionDepsT] | None = None,
     prompts: Sequence[Callable[..., Any]] | None = None,
     name: str = "pydantic-ai-mcp",
     bootstrap_deps: Any = None,
@@ -203,11 +225,12 @@ async def create_mcp_server(
 | Parameter | Description |
 |---|---|
 | `toolsets` | `AbstractToolset` instances — same as `Agent(toolsets=[...])` |
-| `deps` | Deps instance, sync factory, or async factory — called fresh per invocation |
+| `deps` | Deps instance, sync/async factory `() -> DepsT`, or session factory `(state: SessionDepsT) -> DepsT` |
+| `session_deps` | Pydantic `BaseModel` class whose instance is loaded from the session store before each call and saved back after |
 | `prompts` | Prompt functions: `(ctx: RunContext[DepsT], **kwargs) -> str \| list[Message] \| PromptResult` |
 | `name` | Server name shown to MCP clients |
 | `bootstrap_deps` | Deps used only during startup tool discovery (safe as `None` for `FunctionToolset`) |
-| `**fastmcp_kwargs` | Forwarded to `FastMCP(...)` — e.g. `instructions`, `version` |
+| `**fastmcp_kwargs` | Forwarded to `FastMCP(...)` — e.g. `instructions`, `session_state_store` |
 
 Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server. Call `await server.run_async(transport="stdio")` to start it.
 
@@ -220,8 +243,8 @@ Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server. 
 | [`examples/01_simple_tools.py`](examples/01_simple_tools.py) | Minimal setup — a toolset with fixed deps |
 | [`examples/02_deps_factory.py`](examples/02_deps_factory.py) | Per-call deps factory, environment config, prompts with runtime context |
 | [`examples/03_reuse_across_agent_and_mcp.py`](examples/03_reuse_across_agent_and_mcp.py) | The core case — one toolset wired to both a pydantic-ai Agent and an MCP server |
-| [`examples/04_session_deps.py`](examples/04_session_deps.py) | Session-scoped caching — expensive auth computed once per MCP session via `ctx.get_state` / `ctx.set_state` |
-| [`examples/05_redis_session_store.py`](examples/05_redis_session_store.py) | Distributed sessions — Redis-backed state shared across replicas, persistent across restarts |
+| [`examples/04_session_deps.py`](examples/04_session_deps.py) | Session-scoped state — auth cached once, notes persisted across calls; tools just mutate `ctx.deps.state` |
+| [`examples/05_redis_session_store.py`](examples/05_redis_session_store.py) | Redis backing store — identical code to 04, one extra parameter for distributed persistence |
 
 ---
 
@@ -229,9 +252,13 @@ Returns a configured [`FastMCP`](https://gofastmcp.com/servers/fastmcp) server. 
 
 `create_mcp_server` calls `toolset.get_tools()` at startup to discover tool schemas, then wraps each `ToolsetTool` in a thin FastMCP `Tool` subclass. On each MCP call:
 
-1. Args are validated through pydantic-ai's schema validator (type coercion: `str → datetime`, `dict → BaseModel`, etc.)
-2. A fresh `RunContext` is built with deps from the factory
-3. `toolset.call_tool()` is called — the same path pydantic-ai's agent run loop uses
+1. If `session_deps` is set: the stored state is deserialised from the session store and passed to the `deps` factory
+2. Args are validated through pydantic-ai's schema validator (type coercion: `str → datetime`, `dict → BaseModel`, etc.)
+3. A fresh `RunContext` is built with the deps returned by the factory
+4. `toolset.call_tool()` is called — the same path pydantic-ai's agent run loop uses
+5. If `session_deps` is set: the (possibly mutated) state instance is serialised back to the store
+
+Because the state is passed by reference into the factory and from there into `Deps`, any mutations the tool makes to `ctx.deps.state` are automatically captured in step 5 — no explicit save calls needed.
 
 Prompt functions get the same treatment: `RunContext` is injected at render time; the remaining parameters are surfaced as typed MCP prompt arguments.
 

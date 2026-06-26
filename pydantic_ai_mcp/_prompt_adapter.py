@@ -8,6 +8,7 @@ from fastmcp.prompts.base import Prompt, PromptArgument
 from pydantic import PrivateAttr
 
 from ._context import make_call_context
+from ._tool_adapter import _load_session_state, _save_session_state
 
 
 class PydanticAIPromptAdapter(Prompt):
@@ -26,6 +27,7 @@ class PydanticAIPromptAdapter(Prompt):
     _fn: Callable[..., Any] = PrivateAttr()
     _deps_factory: Any = PrivateAttr()
     _max_retries: int = PrivateAttr(default=0)
+    _session_deps_cls: type[Any] | None = PrivateAttr(default=None)
 
     @classmethod
     def from_function(
@@ -36,6 +38,7 @@ class PydanticAIPromptAdapter(Prompt):
         max_retries: int = 0,
         name: str | None = None,
         description: str | None = None,
+        session_deps_cls: type[Any] | None = None,
     ) -> PydanticAIPromptAdapter:
         sig = inspect.signature(fn)
         all_params = list(sig.parameters.values())
@@ -59,15 +62,22 @@ class PydanticAIPromptAdapter(Prompt):
         instance._fn = fn
         instance._deps_factory = deps_factory
         instance._max_retries = max_retries
+        instance._session_deps_cls = session_deps_cls
         return instance
 
     async def render(self, arguments: dict[str, Any] | None = None) -> Any:
+        session_state, fmcp_ctx = await _load_session_state(self._session_deps_cls)
+
         ctx = await make_call_context(
             self._deps_factory,
+            session_state=session_state,
             max_retries=self._max_retries,
         )
         result = self._fn(ctx, **(arguments or {}))
         if inspect.isawaitable(result):
             result = await result
+
+        await _save_session_state(session_state, fmcp_ctx)
+
         # convert_result() is inherited from Prompt and handles str / list[Message] / PromptResult
         return result

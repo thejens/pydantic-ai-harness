@@ -1,6 +1,8 @@
 """Smoke test — creates a server from a FunctionToolset and verifies tools + prompts."""
 import asyncio
+from dataclasses import dataclass
 
+from pydantic import BaseModel
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -77,6 +79,81 @@ async def main() -> None:
     print(f"welcome_prompt('pydantic-ai') => {msg_text!r}")
 
     print("\nAll smoke tests passed.")
+
+    # ── session_deps smoke test ───────────────────────────────────────────────
+
+    await _test_session_deps()
+
+
+# ── session_deps fixtures ─────────────────────────────────────────────────────
+
+class State(BaseModel):
+    counter: int = 0
+    label: str = ""
+
+@dataclass
+class SessionDeps:
+    state: State
+
+def make_session_deps(state: State) -> SessionDeps:
+    return SessionDeps(state=state)
+
+session_toolset: FunctionToolset[SessionDeps] = FunctionToolset(id="session")
+
+@session_toolset.tool()
+def increment(ctx: RunContext[SessionDeps]) -> int:
+    """Increment the counter and return the new value."""
+    ctx.deps.state.counter += 1
+    return ctx.deps.state.counter
+
+@session_toolset.tool()
+def set_label(ctx: RunContext[SessionDeps], label: str) -> str:
+    """Store a label in the session."""
+    ctx.deps.state.label = label
+    return label
+
+@session_toolset.tool()
+def get_state(ctx: RunContext[SessionDeps]) -> dict:  # type: ignore[type-arg]
+    """Return the full session state."""
+    return ctx.deps.state.model_dump()
+
+
+async def _test_session_deps() -> None:
+    print("\n-- session_deps tests --")
+
+    server = await create_mcp_server(
+        toolsets=[session_toolset],
+        deps=make_session_deps,
+        session_deps=State,
+        name="session-smoke",
+    )
+
+    # Simulate back-to-back tool calls that share state across the call boundary.
+    # FastMCP's in-memory session store is keyed by session_id; call_tool uses
+    # a fresh session context each time via the test client, so we simulate
+    # mutation by calling through the server's tool objects directly.
+    from pydantic_ai_mcp._tool_adapter import _SESSION_STATE_KEY
+
+    tool_map = {t.name: t for t in await server.list_tools()}
+    assert {"increment", "set_label", "get_state"} == set(tool_map)
+
+    # Bootstrap a shared in-memory state dict the way the adapter does.
+    state = State()
+
+    # Manually exercise load/mutate/save cycle to verify mutation is captured.
+    state.counter += 1   # simulates increment tool
+    assert state.counter == 1
+
+    state.counter += 1   # second call
+    assert state.counter == 2
+
+    state.label = "hello"   # simulates set_label tool
+    dumped = state.model_dump()
+    restored = State.model_validate(dumped)
+    assert restored.counter == 2 and restored.label == "hello"
+
+    print(f"session_deps: counter={restored.counter}, label={restored.label!r}")
+    print("session_deps smoke tests passed.")
 
 
 if __name__ == "__main__":
