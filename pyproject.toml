@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pydantic-ai-mcp"
+version = "0.1.0"
+description = "Bridge pydantic-ai toolsets and prompts to a FastMCP server"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-ai-slim",
+    "fastmcp>=3.4.0",
+]
+
+[project.optional-dependencies]
+examples = ["httpx>=0.28.1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pydantic_ai_mcp"]
